@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+*.app
+*.dmg
+
+# Xcode
+*.xcuserstate
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+*.swp
+
+# Recordings (user data)
+recordings/
+
+# Dependencies
+.build/
+Packages/
+
+# Secrets & credentials
+.env*
+*.p12
+*.cer
+*.mobileprovision
+*.key
+*.pem
+*.provisionprofile
+
+# Beads (contains personal email in issue tracker)
+.beads/
