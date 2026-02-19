@@ -17,12 +17,18 @@ class SimpleRecorder {
     private var audioInputFile: AVAudioFile?
     
     // Pre-buffering for AVAudioEngine (captures audio before user presses record)
-    private var preBuffer: [AVAudioPCMBuffer] = []
-    private let preBufferLock = NSLock()
-    private let preBufferDuration: TimeInterval = 2.0  // Keep 2 seconds of pre-buffer
+    // Uses a lock-free ring buffer to avoid blocking the audio hardware thread
+    private var preBuffer: [AVAudioPCMBuffer?]  // Ring buffer (fixed size, no reallocation)
+    private var preBufferWriteIndex: Int = 0     // Written by audio thread only
+    private var preBufferCount: Int = 0          // Approximate count for pre-buffer reads
+    private let preBufferLock = NSLock()          // Only used by NON-audio-thread reads
+    private let preBufferDuration: TimeInterval = 2.0
     private var isPreBuffering = false
     private var isRecording = false
     private var preBufferFormat: AVAudioFormat?
+
+    // I/O queue — all file writes happen here, never on the audio thread
+    private let ioQueue = DispatchQueue(label: "com.murmur.audio-io", qos: .utility)
     
     // VAD (Voice Activity Detection) for continuous mode
     enum VADState { case idle, listening, speaking, silence }
@@ -57,6 +63,8 @@ class SimpleRecorder {
     private var micChunkOverlapFrames: UInt32 = 0
     
     init() {
+        // Initialize ring buffer with capacity for ~2s at 48kHz/4096 buffers
+        preBuffer = [AVAudioPCMBuffer?](repeating: nil, count: 30)
         // Start pre-buffering immediately for instant recording
         startPreBuffering()
     }
@@ -78,14 +86,16 @@ class SimpleRecorder {
         
         preBufferFormat = inputFormat
         let maxBufferCount = Int(preBufferDuration * inputFormat.sampleRate / 4096) + 1
-        
+        // Resize ring buffer to fit
+        preBuffer = [AVAudioPCMBuffer?](repeating: nil, count: maxBufferCount)
+
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, time in
             guard let self = self else { return }
-            
-            // Calculate RMS for VAD
+
+            // Calculate RMS for VAD (lightweight — just reads float data)
             let rms = self.calculateRMS(buffer: buffer)
-            
-            // Make a copy of the buffer
+
+            // Make a copy of the buffer (unavoidable — buffer is reused by system)
             guard let bufferCopy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else { return }
             bufferCopy.frameLength = buffer.frameLength
             if let src = buffer.floatChannelData, let dst = bufferCopy.floatChannelData {
@@ -93,53 +103,44 @@ class SimpleRecorder {
                     memcpy(dst[ch], src[ch], Int(buffer.frameLength) * MemoryLayout<Float>.size)
                 }
             }
-            
-            self.preBufferLock.lock()
-            
-            // Handle continuous mode VAD
-            if self.isContinuousMode {
-                self.processVAD(rms: rms, buffer: bufferCopy)
-            } else if self.isRecording {
-                // Manual mode: write directly to file when recording
-                if let outputFile = self.audioInputFile {
-                    do {
-                        try outputFile.write(from: bufferCopy)
-                    } catch {
-                        // Ignore write errors
-                    }
-                }
-                // Also write to mic chunk file for live transcription
-                if self.isFileRecordingMode {
-                    // Maintain overlap buffer (last 5s for next chunk)
-                    self.micOverlapBuffer.append(bufferCopy)
-                    let sampleRate = self.preBufferFormat?.sampleRate ?? 48000
-                    let maxOverlapBuffers = Int(self.overlapDuration * sampleRate / 4096) + 1
-                    while self.micOverlapBuffer.count > maxOverlapBuffers {
-                        self.micOverlapBuffer.removeFirst()
-                    }
 
-                    if let chunkFile = self.micChunkFile {
-                        do {
-                            try chunkFile.write(from: bufferCopy)
-                        } catch {}
-                        self.micChunkFrameCount += bufferCopy.frameLength
-                        // Only count new frames (exclude overlap) for chunk duration
-                        let newFrames = self.micChunkFrameCount - self.micChunkOverlapFrames
-                        let elapsed = Double(newFrames) / sampleRate
-                        if elapsed >= self.chunkDuration {
-                            self.finishMicChunk()
+            // Handle continuous mode VAD (needs to run on audio thread for timing)
+            if self.isContinuousMode {
+                self.preBufferLock.lock()
+                self.processVAD(rms: rms, buffer: bufferCopy)
+                self.preBufferLock.unlock()
+            } else if self.isRecording {
+                // Dispatch ALL file I/O to the ioQueue — never block the audio thread
+                self.ioQueue.async {
+                    if let outputFile = self.audioInputFile {
+                        try? outputFile.write(from: bufferCopy)
+                    }
+                    if self.isFileRecordingMode {
+                        // Maintain overlap buffer
+                        self.micOverlapBuffer.append(bufferCopy)
+                        let sampleRate = self.preBufferFormat?.sampleRate ?? 48000
+                        let maxOverlap = Int(self.overlapDuration * sampleRate / 4096) + 1
+                        while self.micOverlapBuffer.count > maxOverlap {
+                            self.micOverlapBuffer.removeFirst()
+                        }
+                        if let chunkFile = self.micChunkFile {
+                            try? chunkFile.write(from: bufferCopy)
+                            self.micChunkFrameCount += bufferCopy.frameLength
+                            let newFrames = self.micChunkFrameCount - self.micChunkOverlapFrames
+                            let elapsed = Double(newFrames) / sampleRate
+                            if elapsed >= self.chunkDuration {
+                                self.finishMicChunk()
+                            }
                         }
                     }
                 }
             } else {
-                // Add to pre-buffer when not recording
-                self.preBuffer.append(bufferCopy)
-                // Keep only the last N buffers
-                while self.preBuffer.count > maxBufferCount {
-                    self.preBuffer.removeFirst()
-                }
+                // Ring buffer write — no lock, no allocation, no array shift
+                let idx = self.preBufferWriteIndex % self.preBuffer.count
+                self.preBuffer[idx] = bufferCopy
+                self.preBufferWriteIndex += 1
+                self.preBufferCount = min(self.preBufferCount + 1, self.preBuffer.count)
             }
-            self.preBufferLock.unlock()
         }
         
         do {
@@ -247,7 +248,7 @@ class SimpleRecorder {
                 
                 // Dispatch transcription with captured values
                 if let url = capturedURL, let timestamp = capturedTimestamp {
-                    DispatchQueue.global(qos: .userInitiated).async {
+                    DispatchQueue.global(qos: .utility).async {
                         self.processAndTranscribe(url: url, timestamp: timestamp)
                     }
                 }
@@ -293,13 +294,19 @@ class SimpleRecorder {
         do {
             audioInputFile = try AVAudioFile(forWriting: tempURL, settings: format.settings)
             
-            // Write pre-buffer first
+            // Drain ring buffer
             var preBufferFrames: UInt32 = 0
-            for buffer in preBuffer {
-                try? audioInputFile?.write(from: buffer)
-                preBufferFrames += buffer.frameLength
+            let count = min(preBufferCount, preBuffer.count)
+            let startIdx = (preBufferWriteIndex - count + preBuffer.count) % preBuffer.count
+            for i in 0..<count {
+                let idx = (startIdx + i) % preBuffer.count
+                if let buf = preBuffer[idx] {
+                    try? audioInputFile?.write(from: buf)
+                    preBufferFrames += buf.frameLength
+                    preBuffer[idx] = nil
+                }
             }
-            preBuffer.removeAll()
+            preBufferCount = 0
             
             let preBufferSeconds = Double(preBufferFrames) / format.sampleRate
             Logger.shared.log("VAD: Wrote \(String(format: "%.2f", preBufferSeconds))s of pre-buffer")
@@ -576,25 +583,23 @@ class SimpleRecorder {
             return
         }
         
-        // Write pre-buffer to file first (captures audio from before user pressed record)
-        preBufferLock.lock()
-        let buffersToWrite = preBuffer
-        preBuffer.removeAll()
+        // Drain ring buffer into file (captures audio from before user pressed record)
         isRecording = true
-        preBufferLock.unlock()
-        
         var preBufferFrames: UInt32 = 0
-        for buffer in buffersToWrite {
-            do {
-                try audioInputFile?.write(from: buffer)
-                preBufferFrames += buffer.frameLength
-            } catch {
-                // Ignore write errors
+        let count = min(preBufferCount, preBuffer.count)
+        let startIdx = (preBufferWriteIndex - count + preBuffer.count) % preBuffer.count
+        for i in 0..<count {
+            let idx = (startIdx + i) % preBuffer.count
+            if let buf = preBuffer[idx] {
+                try? audioInputFile?.write(from: buf)
+                preBufferFrames += buf.frameLength
+                preBuffer[idx] = nil
             }
         }
+        preBufferCount = 0
         
         let preBufferSeconds = Double(preBufferFrames) / format.sampleRate
-        Logger.shared.log("Wrote \(String(format: "%.2f", preBufferSeconds))s of pre-buffer (\(buffersToWrite.count) buffers)")
+        Logger.shared.log("Wrote \(String(format: "%.2f", preBufferSeconds))s of pre-buffer (\(count) buffers)")
         Logger.shared.log("Recording started - capturing live audio")
 
         // Start first mic chunk for live transcription
@@ -708,18 +713,20 @@ class SimpleRecorder {
             .replacingOccurrences(of: ".temp.wav", with: ".wav")
         let chunkURL = chunksDir.appendingPathComponent(chunkName)
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Convert to 16kHz WAV for whisper
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            // Convert to 16kHz WAV for whisper (with timeout)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
             process.arguments = ["-f", "WAVE", "-d", "LEI16@16000", chunkTempURL.path, chunkURL.path]
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
-            try? process.run()
-            process.waitUntilExit()
+            guard self.runWithTimeout(process, timeout: 15) else {
+                try? FileManager.default.removeItem(at: chunkTempURL)
+                return
+            }
             try? FileManager.default.removeItem(at: chunkTempURL)
-
-            self?.transcribeChunk(url: chunkURL, source: "mic", chunkName: chunkName, overlapSeconds: overlapSecs)
+            self.transcribeChunk(url: chunkURL, source: "mic", chunkName: chunkName, overlapSeconds: overlapSecs)
         }
     }
 
@@ -754,6 +761,27 @@ class SimpleRecorder {
         }
     }
 
+    /// Run a process with a timeout — kills it if it takes too long
+    private func runWithTimeout(_ process: Process, timeout: TimeInterval = 30) -> Bool {
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        let deadline = DispatchTime.now() + timeout
+        let sem = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            process.waitUntilExit()
+            sem.signal()
+        }
+        if sem.wait(timeout: deadline) == .timedOut {
+            process.terminate()
+            Logger.shared.log("WARNING: Process killed after \(Int(timeout))s timeout")
+            return false
+        }
+        return process.terminationStatus == 0
+    }
+
     private func transcribeChunkWithOverlap(url: URL, overlapSeconds: TimeInterval, whisperPath: String, modelPath: String) -> String {
         guard FileManager.default.fileExists(atPath: url.path) else { return "" }
 
@@ -770,21 +798,15 @@ class SimpleRecorder {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
 
-        do {
-            try process.run()
-            process.waitUntilExit()
+        guard runWithTimeout(process) else { return "" }
 
-            let srtPath = outputPath + ".srt"
-            guard let srt = try? String(contentsOfFile: srtPath, encoding: .utf8) else { return "" }
-            try? FileManager.default.removeItem(atPath: srtPath)
+        let srtPath = outputPath + ".srt"
+        guard let srt = try? String(contentsOfFile: srtPath, encoding: .utf8) else { return "" }
+        try? FileManager.default.removeItem(atPath: srtPath)
 
-            // Parse SRT and keep only entries after the overlap
-            let entries = parseSRT(srt, source: "")
-            let filtered = entries.filter { $0.0 >= overlapSeconds - 0.5 } // small tolerance
-            return filtered.map { $0.2 }.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        } catch {
-            return ""
-        }
+        let entries = parseSRT(srt, source: "")
+        let filtered = entries.filter { $0.0 >= overlapSeconds - 0.5 }
+        return filtered.map { $0.2 }.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func transcribeChunkSync(url: URL, whisperPath: String, modelPath: String) -> String {
@@ -803,17 +825,13 @@ class SimpleRecorder {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
 
-        do {
-            try process.run()
-            process.waitUntilExit()
+        guard runWithTimeout(process) else { return "" }
 
-            let txtPath = outputPath + ".txt"
-            if let transcript = try? String(contentsOfFile: txtPath, encoding: .utf8) {
-                try? FileManager.default.removeItem(atPath: txtPath)
-                return transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        } catch {}
-
+        let txtPath = outputPath + ".txt"
+        if let transcript = try? String(contentsOfFile: txtPath, encoding: .utf8) {
+            try? FileManager.default.removeItem(atPath: txtPath)
+            return transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         return ""
     }
 
@@ -855,7 +873,7 @@ class SimpleRecorder {
                 let config = SCStreamConfiguration()
                 config.capturesAudio = true
                 config.excludesCurrentProcessAudio = true
-                config.sampleRate = 16000
+                config.sampleRate = 48000  // Match system audio rate — avoid real-time resampling interference
                 config.channelCount = 1
                 config.width = 2
                 config.height = 2
@@ -867,7 +885,7 @@ class SimpleRecorder {
                 if self.isFileRecordingMode, let sessionDir = self.sessionDir {
                     self.audioOutput!.chunksDir = sessionDir.appendingPathComponent("chunks")
                     self.audioOutput!.onChunkReady = { [weak self] url, overlapSecs in
-                        DispatchQueue.global(qos: .userInitiated).async {
+                        DispatchQueue.global(qos: .utility).async {
                             self?.transcribeChunk(url: url, source: "audio", chunkName: url.lastPathComponent, overlapSeconds: overlapSecs)
                         }
                     }
@@ -1162,28 +1180,31 @@ class AudioOutput: NSObject, SCStreamOutput {
     private var audioFile: AVAudioFile?
     private let url: URL
     private var sampleCount = 0
+    private var detectedSampleRate: Double = 48000  // Will be set from first sample
 
     // Chunk support for live transcription
     var chunksDir: URL?
     private var chunkFile: AVAudioFile?
     private var chunkSampleCount: Int = 0
     private var chunkIndex: Int = 0
-    private let samplesPerChunk: Int = 16000 * 15 // 15s at 16kHz
+    private var samplesPerChunk: Int { Int(detectedSampleRate) * 15 }  // 15s
     var onChunkReady: ((URL, TimeInterval) -> Void)?  // (url, overlapSeconds)
 
     // Overlap buffer for seamless chunk boundaries
     private var overlapBuffer: [AVAudioPCMBuffer] = []
-    private let overlapSamples: Int = 16000 * 5 // 5s at 16kHz
+    private var overlapSamples: Int { Int(detectedSampleRate) * 5 }  // 5s
     private var chunkOverlapSampleCount: Int = 0
 
-    private let audioSettings: [String: Any] = [
-        AVFormatIDKey: Int(kAudioFormatLinearPCM),
-        AVSampleRateKey: 16000.0,
-        AVNumberOfChannelsKey: 1,
-        AVLinearPCMBitDepthKey: 16,
-        AVLinearPCMIsFloatKey: false,
-        AVLinearPCMIsBigEndianKey: false
-    ]
+    private var audioSettings: [String: Any] {
+        [
+            AVFormatIDKey: Int(kAudioFormatLinearPCM),
+            AVSampleRateKey: detectedSampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false
+        ]
+    }
 
     init(url: URL) {
         self.url = url
@@ -1196,7 +1217,14 @@ class AudioOutput: NSObject, SCStreamOutput {
 
         sampleCount += 1
         if sampleCount == 1 {
-            Logger.shared.log("First audio sample received from system")
+            // Detect actual sample rate from first sample
+            if let desc = sampleBuffer.formatDescription,
+               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)?.pointee {
+                detectedSampleRate = asbd.mSampleRate
+                Logger.shared.log("First audio sample received from system (rate=\(Int(detectedSampleRate))Hz)")
+            } else {
+                Logger.shared.log("First audio sample received from system")
+            }
         }
 
         if audioFile == nil {
@@ -1239,7 +1267,7 @@ class AudioOutput: NSObject, SCStreamOutput {
                 }
                 chunkSampleCount = overlapWritten
                 chunkOverlapSampleCount = overlapWritten
-                Logger.shared.log("Started system chunk \(chunkIndex) at \(elapsed)s (with \(String(format: "%.1f", Double(overlapWritten) / 16000))s overlap)")
+                Logger.shared.log("Started system chunk \(chunkIndex) at \(elapsed)s (with \(String(format: "%.1f", Double(overlapWritten) / detectedSampleRate))s overlap)")
             } else {
                 Logger.shared.log("Started system chunk \(chunkIndex) at \(elapsed)s")
             }
@@ -1250,7 +1278,7 @@ class AudioOutput: NSObject, SCStreamOutput {
 
     private func finishSystemChunk() {
         let chunkURL = chunkFile?.url
-        let overlapSecs = Double(chunkOverlapSampleCount) / 16000.0
+        let overlapSecs = Double(chunkOverlapSampleCount) / detectedSampleRate
         chunkFile = nil
         chunkSampleCount = 0
         chunkOverlapSampleCount = 0
@@ -1264,7 +1292,7 @@ class AudioOutput: NSObject, SCStreamOutput {
 
     func finishCurrentChunk() {
         if let url = chunkFile?.url {
-            let overlapSecs = Double(chunkOverlapSampleCount) / 16000.0
+            let overlapSecs = Double(chunkOverlapSampleCount) / detectedSampleRate
             chunkFile = nil
             chunkSampleCount = 0
             chunkOverlapSampleCount = 0
