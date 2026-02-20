@@ -22,6 +22,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     // Menu items that need updating
     var startStopMenuItem: NSMenuItem!
+    var pttMenuItem: NSMenuItem!
+    var vadMenuItem: NSMenuItem!
     
     static func main() {
         let app = NSApplication.shared
@@ -63,23 +65,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Build the menu
         menu = NSMenu()
         
-        // Start/Stop Recording (top item)
-        startStopMenuItem = NSMenuItem(title: "Start Recording", action: #selector(toggleRecordingFromMenu), keyEquivalent: "")
-        startStopMenuItem.target = self
-        if let recordImage = NSImage(systemSymbolName: "record.circle", accessibilityDescription: nil) {
-            startStopMenuItem.image = recordImage
+        // Start/Stop PTT
+        pttMenuItem = NSMenuItem(title: "Start PTT", action: #selector(startPTTFromMenu), keyEquivalent: "")
+        pttMenuItem.target = self
+        if let micImage = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil) {
+            pttMenuItem.image = micImage
         }
-        menu.addItem(startStopMenuItem)
+        menu.addItem(pttMenuItem)
+        
+        // Start/Stop VAD
+        vadMenuItem = NSMenuItem(title: "Start VAD", action: #selector(startVADFromMenu), keyEquivalent: "")
+        vadMenuItem.target = self
+        if let waveImage = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: nil) {
+            vadMenuItem.image = waveImage
+        }
+        menu.addItem(vadMenuItem)
         
         menu.addItem(NSMenuItem.separator())
-        
-        // Open Recordings Folder
-        let openFolderItem = NSMenuItem(title: "Open Recordings Folder", action: #selector(openRecordingsFolder), keyEquivalent: "")
-        openFolderItem.target = self
-        if let folderImage = NSImage(systemSymbolName: "folder", accessibilityDescription: nil) {
-            openFolderItem.image = folderImage
-        }
-        menu.addItem(openFolderItem)
         
         // Settings
         let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ",")
@@ -112,16 +114,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Clean up any orphaned temp audio files from previous sessions
         cleanupOrphanedTempFiles()
 
-        // Install Carbon event handler once, then register hotkey from settings
-        installHotKeyEventHandler()
-        let hotKey = Settings.shared.fileRecordingHotKey
-        registerHotKey(keyCode: hotKey.keyCode, modifiers: hotKey.modifiers)
-
         // Register modifier tap detection for PTT clipboard
         setupDoubleTapCmd()
 
-        // Observe settings changes for hotkey re-registration
-        NotificationCenter.default.addObserver(self, selector: #selector(hotKeySettingsChanged), name: .fileRecordingHotKeyChanged, object: nil)
+        // Observe settings changes
         NotificationCenter.default.addObserver(self, selector: #selector(tapModifierSettingsChanged), name: .tapModifierChanged, object: nil)
     }
     
@@ -287,8 +283,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    @objc func openRecordingsFolder() {
-        NSWorkspace.shared.open(Settings.shared.recordingsFolder)
+    @objc func startPTTFromMenu() {
+        if isRecording && pttMode {
+            stopRecording()
+            pttMode = false
+        } else if !isRecording && !continuousMode {
+            pttMode = true
+            startRecording(autoPaste: true)
+        }
+    }
+    
+    @objc func startVADFromMenu() {
+        toggleContinuousMode()
     }
     
     @objc func openSettings() {
@@ -332,30 +338,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateIcon() {
         if let button = statusItem.button {
             if continuousMode {
-                // Continuous mode (⌘⌘⌘) - RED
+                // VAD active - RED
                 let image = createColoredIcon(color: .systemRed)
                 button.image = image
-                startStopMenuItem?.title = "Stop Continuous Mode"
-                startStopMenuItem?.image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: nil)
             } else if isRecording && pttMode {
-                // PTT mode (⌘⌘) - BLUE
+                // PTT active - BLUE
                 let image = createColoredIcon(color: .systemBlue)
                 button.image = image
-                startStopMenuItem?.title = "Stop Recording"
-                startStopMenuItem?.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: nil)
-            } else if isRecording {
-                // File recording (⌘ Space) - GREEN
-                let image = createColoredIcon(color: .systemGreen)
-                button.image = image
-                startStopMenuItem?.title = "Stop Recording"
-                startStopMenuItem?.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: nil)
             } else {
                 let image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Murmur")
-                image?.isTemplate = true  // Automatically adapts to light/dark menu bar
+                image?.isTemplate = true
                 button.image = image
-                startStopMenuItem?.title = "Start Recording"
-                startStopMenuItem?.image = NSImage(systemSymbolName: "record.circle", accessibilityDescription: nil)
             }
+        }
+        // Update PTT menu item
+        if isRecording && pttMode {
+            pttMenuItem?.title = "Stop PTT"
+            pttMenuItem?.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: nil)
+        } else {
+            pttMenuItem?.title = "Start PTT"
+            pttMenuItem?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
+        }
+        // Update VAD menu item
+        if continuousMode {
+            vadMenuItem?.title = "Stop VAD"
+            vadMenuItem?.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: nil)
+        } else {
+            vadMenuItem?.title = "Start VAD"
+            vadMenuItem?.image = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: nil)
         }
     }
     

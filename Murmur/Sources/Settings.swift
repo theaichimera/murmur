@@ -699,30 +699,17 @@ class SettingsWindowController: NSWindowController {
         yOffset -= 90
         
         // ════════════════════════════════════════════════════════════
-        // RECORDINGS CARD
-        // ════════════════════════════════════════════════════════════
-        let recordingsCard = createCard(width: windowWidth - cardPadding * 2, height: 120)
-        recordingsCard.frame.origin = NSPoint(x: cardPadding, y: yOffset - 120)
-        
-        let recordingsContent = createRecordingsSection()
-        recordingsContent.frame.origin = NSPoint(x: innerPadding, y: innerPadding)
-        recordingsCard.addSubview(recordingsContent)
-        
-        container.addSubview(recordingsCard)
-        yOffset -= 132
-        
-        // ════════════════════════════════════════════════════════════
         // KEYBOARD SHORTCUTS CARD
         // ════════════════════════════════════════════════════════════
-        let shortcutsCard = createCard(width: windowWidth - cardPadding * 2, height: 310)
-        shortcutsCard.frame.origin = NSPoint(x: cardPadding, y: yOffset - 310)
+        let shortcutsCard = createCard(width: windowWidth - cardPadding * 2, height: 240)
+        shortcutsCard.frame.origin = NSPoint(x: cardPadding, y: yOffset - 240)
 
         let shortcutsContent = createShortcutsSection()
         shortcutsContent.frame.origin = NSPoint(x: innerPadding, y: innerPadding)
         shortcutsCard.addSubview(shortcutsContent)
 
         container.addSubview(shortcutsCard)
-        yOffset -= 322
+        yOffset -= 252
         
         // ════════════════════════════════════════════════════════════
         // AUDIO DEVICES CARD
@@ -897,9 +884,9 @@ class SettingsWindowController: NSWindowController {
     
     private func createShortcutsSection() -> NSView {
         let width = windowWidth - cardPadding * 2 - innerPadding * 2
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 285))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 215))
 
-        var y: CGFloat = 262
+        var y: CGFloat = 192
 
         // Section title + Reset button
         let title = createSectionTitle(title: "Keyboard Shortcuts", icon: "keyboard")
@@ -914,32 +901,6 @@ class SettingsWindowController: NSWindowController {
         resetBtn.frame.origin = NSPoint(x: width - resetBtn.frame.width, y: y)
         container.addSubview(resetBtn)
         y -= 32
-
-        // "File Recording" label
-        let fileLabel = NSTextField(labelWithString: "File Recording")
-        fileLabel.frame = NSRect(x: 0, y: y, width: 200, height: 16)
-        fileLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        fileLabel.textColor = .labelColor
-        container.addSubview(fileLabel)
-        y -= 26
-
-        // ShortcutRecorderView + description
-        let recorder = ShortcutRecorderView(
-            frame: NSRect(x: 0, y: y, width: 200, height: 32),
-            hotKey: Settings.shared.fileRecordingHotKey
-        )
-        recorder.onHotKeyChanged = { newHotKey in
-            Settings.shared.fileRecordingHotKey = newHotKey
-        }
-        shortcutRecorder = recorder
-        container.addSubview(recorder)
-
-        let fileDesc = NSTextField(labelWithString: "Start/stop recording to file")
-        fileDesc.frame = NSRect(x: 210, y: y + 6, width: width - 210, height: 20)
-        fileDesc.font = NSFont.systemFont(ofSize: 12)
-        fileDesc.textColor = .secondaryLabelColor
-        container.addSubview(fileDesc)
-        y -= 40
 
         // "Modifier Tap" label
         let tapLabel = NSTextField(labelWithString: "Modifier Tap")
@@ -1053,12 +1014,10 @@ class SettingsWindowController: NSWindowController {
     }
 
     @objc private func resetShortcutsToDefaults() {
-        Settings.shared.fileRecordingHotKey = .defaultFileRecording
         Settings.shared.tapModifier = .command
         Settings.shared.doubleTapEnabled = true
         Settings.shared.tripleTapEnabled = true
 
-        shortcutRecorder?.update(hotKey: .defaultFileRecording)
         doubleTapCheckbox?.state = .on
         tripleTapCheckbox?.state = .on
 
