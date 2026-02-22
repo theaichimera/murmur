@@ -119,6 +119,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Observe settings changes
         NotificationCenter.default.addObserver(self, selector: #selector(tapModifierSettingsChanged), name: .tapModifierChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(secondChairSettingsChanged), name: .secondChairChanged, object: nil)
+
+        // Start SecondChair command polling if configured
+        setupSecondChair()
     }
     
     func installHotKeyEventHandler() {
@@ -424,6 +428,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if cleaned > 0 {
             Logger.shared.log("Cleaned up \(cleaned) orphaned temp file(s)")
         }
+    }
+
+    // MARK: - SecondChair Integration
+
+    var activeSessionId: String?  // Set when recording was triggered by SecondChair
+
+    func setupSecondChair() {
+        let client = SecondChairClient.shared
+
+        client.onStartRecording = { [weak self] sessionId, title, meetingLink in
+            guard let self = self else { return }
+            Logger.shared.log("SecondChair: Start recording — session: \(sessionId ?? "none"), title: \(title ?? "none")")
+
+            self.activeSessionId = sessionId
+
+            // Start file recording (same as menu Start Recording)
+            if !self.isRecording && !self.continuousMode {
+                self.pttMode = false
+                self.startRecording(autoPaste: false)
+            }
+        }
+
+        client.onStopRecording = { [weak self] in
+            guard let self = self else { return }
+            Logger.shared.log("SecondChair: Stop recording")
+
+            if self.continuousMode {
+                self.stopContinuousMode()
+            } else if self.isRecording {
+                self.pttMode = false
+                self.stopRecording()
+            }
+            self.activeSessionId = nil
+        }
+
+        client.startPolling()
+    }
+
+    @objc func secondChairSettingsChanged() {
+        SecondChairClient.shared.restartIfNeeded()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

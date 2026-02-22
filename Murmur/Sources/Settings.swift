@@ -98,6 +98,7 @@ enum TapModifier: String, CaseIterable {
 extension Notification.Name {
     static let fileRecordingHotKeyChanged = Notification.Name("fileRecordingHotKeyChanged")
     static let tapModifierChanged = Notification.Name("tapModifierChanged")
+    static let secondChairChanged = Notification.Name("secondChairChanged")
 }
 
 class Settings: ObservableObject {
@@ -118,6 +119,9 @@ class Settings: ObservableObject {
         static let tapModifierKey = "tapModifierKey"
         static let doubleTapEnabled = "doubleTapEnabled"
         static let tripleTapEnabled = "tripleTapEnabled"
+        static let secondChairApiKey = "secondChairApiKey"
+        static let secondChairBaseURL = "secondChairBaseURL"
+        static let secondChairEnabled = "secondChairEnabled"
     }
     
     var recordingsFolder: URL {
@@ -240,6 +244,38 @@ class Settings: ObservableObject {
             defaults.set(newValue, forKey: Keys.tripleTapEnabled)
             objectWillChange.send()
         }
+    }
+
+    // MARK: - SecondChair Integration
+
+    var secondChairApiKey: String {
+        get { defaults.string(forKey: Keys.secondChairApiKey) ?? "" }
+        set {
+            defaults.set(newValue, forKey: Keys.secondChairApiKey)
+            objectWillChange.send()
+            Logger.shared.log("SecondChair API key updated")
+        }
+    }
+
+    var secondChairBaseURL: String {
+        get { defaults.string(forKey: Keys.secondChairBaseURL) ?? "https://api.secondchair.xyz" }
+        set {
+            defaults.set(newValue, forKey: Keys.secondChairBaseURL)
+            objectWillChange.send()
+        }
+    }
+
+    var secondChairEnabled: Bool {
+        get { defaults.bool(forKey: Keys.secondChairEnabled) }
+        set {
+            defaults.set(newValue, forKey: Keys.secondChairEnabled)
+            objectWillChange.send()
+            NotificationCenter.default.post(name: .secondChairChanged, object: nil)
+        }
+    }
+
+    var isSecondChairConfigured: Bool {
+        return secondChairEnabled && !secondChairApiKey.isEmpty
     }
 
     private init() {}
@@ -658,14 +694,14 @@ class SettingsWindowController: NSWindowController {
     private var tripleTapBadgesContainer: NSView?
 
     private let windowWidth: CGFloat = 420
-    private let windowHeight: CGFloat = 896
+    private let windowHeight: CGFloat = 1070
     private let cardPadding: CGFloat = 16
     private let cardSpacing: CGFloat = 12
     private let innerPadding: CGFloat = 14
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 896),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 1070),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -736,7 +772,20 @@ class SettingsWindowController: NSWindowController {
         
         container.addSubview(continuousCard)
         yOffset -= 137
-        
+
+        // ════════════════════════════════════════════════════════════
+        // SECONDCHAIR CARD
+        // ════════════════════════════════════════════════════════════
+        let scCard = createCard(width: windowWidth - cardPadding * 2, height: 160)
+        scCard.frame.origin = NSPoint(x: cardPadding, y: yOffset - 160)
+
+        let scContent = createSecondChairSection()
+        scContent.frame.origin = NSPoint(x: innerPadding, y: innerPadding)
+        scCard.addSubview(scContent)
+
+        container.addSubview(scCard)
+        yOffset -= 172
+
     }
     
     // MARK: - Header
@@ -1235,6 +1284,82 @@ class SettingsWindowController: NSWindowController {
         }
     }
     
+    // MARK: - SecondChair Section
+
+    private var scApiKeyField: NSTextField?
+    private var scBaseURLField: NSTextField?
+
+    private func createSecondChairSection() -> NSView {
+        let width = windowWidth - cardPadding * 2 - innerPadding * 2
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 135))
+
+        var y: CGFloat = 112
+
+        // Section title
+        let title = createSectionTitle(title: "SecondChair", icon: "link.circle.fill")
+        title.frame.origin = NSPoint(x: 0, y: y)
+        container.addSubview(title)
+        y -= 32
+
+        // Enable toggle
+        let enableCheckbox = NSButton(checkboxWithTitle: "Enable web pairing", target: self, action: #selector(scEnabledChanged(_:)))
+        enableCheckbox.frame = NSRect(x: 0, y: y, width: 200, height: 20)
+        enableCheckbox.state = Settings.shared.secondChairEnabled ? .on : .off
+        enableCheckbox.font = NSFont.systemFont(ofSize: 13)
+        container.addSubview(enableCheckbox)
+        y -= 30
+
+        // API Key field
+        let keyLabel = NSTextField(labelWithString: "API Key:")
+        keyLabel.frame = NSRect(x: 0, y: y + 2, width: 55, height: 20)
+        keyLabel.font = NSFont.systemFont(ofSize: 13)
+        keyLabel.textColor = .labelColor
+        container.addSubview(keyLabel)
+
+        scApiKeyField = NSSecureTextField(string: Settings.shared.secondChairApiKey)
+        scApiKeyField?.frame = NSRect(x: 60, y: y, width: width - 60, height: 24)
+        scApiKeyField?.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        scApiKeyField?.placeholderString = "sc_..."
+        scApiKeyField?.target = self
+        scApiKeyField?.action = #selector(scApiKeyChanged(_:))
+        scApiKeyField?.isEnabled = Settings.shared.secondChairEnabled
+        container.addSubview(scApiKeyField!)
+        y -= 30
+
+        // Base URL field
+        let urlLabel = NSTextField(labelWithString: "Server:")
+        urlLabel.frame = NSRect(x: 0, y: y + 2, width: 55, height: 20)
+        urlLabel.font = NSFont.systemFont(ofSize: 13)
+        urlLabel.textColor = .labelColor
+        container.addSubview(urlLabel)
+
+        scBaseURLField = NSTextField(string: Settings.shared.secondChairBaseURL)
+        scBaseURLField?.frame = NSRect(x: 60, y: y, width: width - 60, height: 24)
+        scBaseURLField?.font = NSFont.systemFont(ofSize: 12)
+        scBaseURLField?.placeholderString = "https://api.secondchair.xyz"
+        scBaseURLField?.target = self
+        scBaseURLField?.action = #selector(scBaseURLChanged(_:))
+        scBaseURLField?.isEnabled = Settings.shared.secondChairEnabled
+        container.addSubview(scBaseURLField!)
+
+        return container
+    }
+
+    @objc private func scEnabledChanged(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        Settings.shared.secondChairEnabled = enabled
+        scApiKeyField?.isEnabled = enabled
+        scBaseURLField?.isEnabled = enabled
+    }
+
+    @objc private func scApiKeyChanged(_ sender: NSTextField) {
+        Settings.shared.secondChairApiKey = sender.stringValue
+    }
+
+    @objc private func scBaseURLChanged(_ sender: NSTextField) {
+        Settings.shared.secondChairBaseURL = sender.stringValue
+    }
+
     // MARK: - Helpers
     
     private func createStyledPopup(frame: NSRect) -> (container: NSView, popup: NSPopUpButton) {
