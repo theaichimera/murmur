@@ -340,6 +340,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func startRecording(autoPaste: Bool) {
         recorder = SimpleRecorder()
         recorder?.autoPaste = autoPaste
+
+        // Wire chunk upload to SecondChair when recording was triggered by a command
+        if let sessionId = activeSessionId {
+            recorder?.onChunkTranscribed = { text, timestamp, sequenceNum in
+                SecondChairClient.shared.uploadChunk(
+                    sessionId: sessionId,
+                    content: text,
+                    sequenceNum: sequenceNum,
+                    timestamp: timestamp
+                )
+            }
+        }
+
         recorder?.start(fileMode: !autoPaste)
         isRecording = true
         updateIcon()

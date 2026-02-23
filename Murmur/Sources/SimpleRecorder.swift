@@ -38,6 +38,7 @@ class SimpleRecorder {
     private let speechThresholdRMS: Float = 0.01  // RMS level to detect speech
     private var continuousTimestamp: String?
     var onContinuousTranscript: ((String) -> Void)?  // Callback when continuous mode transcribes
+    var onChunkTranscribed: ((String, String, Int) -> Void)?  // (text, timestamp, sequenceNum) — for SecondChair upload
     
     private var silenceThreshold: TimeInterval {
         return Settings.shared.silenceThreshold
@@ -758,6 +759,14 @@ class SimpleRecorder {
             let transcriptURL = sessionDir.appendingPathComponent("transcript.txt")
             appendToFile(line, at: transcriptURL)
             Logger.shared.log("Chunk [\(timeStr) \(source)] transcribed: \(text.prefix(50))...")
+
+            // Notify SecondChair for cloud upload
+            let content = "[\(source)] \(text)"
+            let timestamp = ISO8601DateFormatter().string(from: Date())
+            let seq = self.chunkIndex
+            DispatchQueue.main.async {
+                self.onChunkTranscribed?(content, timestamp, seq)
+            }
         }
     }
 
