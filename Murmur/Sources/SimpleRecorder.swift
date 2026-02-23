@@ -56,12 +56,14 @@ class SimpleRecorder {
     private var micChunkFile: AVAudioFile?
     private var micChunkFrameCount: UInt32 = 0
     private var chunkIndex: Int = 0
-    private let chunkDuration: TimeInterval = 15.0
     private var chunkWhisperPath: String?
     private var chunkModelPath: String?
-    private var micOverlapBuffer: [AVAudioPCMBuffer] = []
-    private let overlapDuration: TimeInterval = 5.0
-    private var micChunkOverlapFrames: UInt32 = 0
+    // VAD-based chunking for file recording mode
+    private var micVADHasSpeech = false
+    private var micVADSilenceStart: Date?
+    private let fileVADSilenceThreshold: TimeInterval = 1.0  // 1s silence → split chunk
+    private let maxChunkDuration: TimeInterval = 30.0  // Safety cap
+    private var micChunkStartTime: Date?
     
     init() {
         // Initialize ring buffer with capacity for ~2s at 48kHz/4096 buffers
@@ -117,19 +119,26 @@ class SimpleRecorder {
                         try? outputFile.write(from: bufferCopy)
                     }
                     if self.isFileRecordingMode {
-                        // Maintain overlap buffer
-                        self.micOverlapBuffer.append(bufferCopy)
-                        let sampleRate = self.preBufferFormat?.sampleRate ?? 48000
-                        let maxOverlap = Int(self.overlapDuration * sampleRate / 4096) + 1
-                        while self.micOverlapBuffer.count > maxOverlap {
-                            self.micOverlapBuffer.removeFirst()
-                        }
                         if let chunkFile = self.micChunkFile {
                             try? chunkFile.write(from: bufferCopy)
                             self.micChunkFrameCount += bufferCopy.frameLength
-                            let newFrames = self.micChunkFrameCount - self.micChunkOverlapFrames
-                            let elapsed = Double(newFrames) / sampleRate
-                            if elapsed >= self.chunkDuration {
+
+                            // VAD-based chunk splitting
+                            let isSpeech = rms > self.speechThresholdRMS
+                            if isSpeech {
+                                self.micVADHasSpeech = true
+                                self.micVADSilenceStart = nil
+                            } else if self.micVADHasSpeech {
+                                if self.micVADSilenceStart == nil {
+                                    self.micVADSilenceStart = Date()
+                                } else if Date().timeIntervalSince(self.micVADSilenceStart!) >= self.fileVADSilenceThreshold {
+                                    self.finishMicChunk()
+                                    return
+                                }
+                            }
+
+                            // Safety cap: force split at max duration
+                            if let start = self.micChunkStartTime, Date().timeIntervalSince(start) >= self.maxChunkDuration {
                                 self.finishMicChunk()
                             }
                         }
@@ -670,23 +679,11 @@ class SimpleRecorder {
         do {
             micChunkFile = try AVAudioFile(forWriting: tempURL, settings: format.settings)
             micChunkFrameCount = 0
-            micChunkOverlapFrames = 0
             chunkIndex += 1
-
-            // Prepend overlap from previous chunk (not for first chunk)
-            if chunkIndex > 1 {
-                var overlapFrames: UInt32 = 0
-                for buffer in micOverlapBuffer {
-                    try? micChunkFile?.write(from: buffer)
-                    overlapFrames += buffer.frameLength
-                }
-                micChunkFrameCount = overlapFrames
-                micChunkOverlapFrames = overlapFrames
-                let overlapSecs = Double(overlapFrames) / format.sampleRate
-                Logger.shared.log("Started mic chunk \(chunkIndex) at \(elapsed)s (with \(String(format: "%.1f", overlapSecs))s overlap)")
-            } else {
-                Logger.shared.log("Started mic chunk \(chunkIndex) at \(elapsed)s")
-            }
+            micVADHasSpeech = false
+            micVADSilenceStart = nil
+            micChunkStartTime = Date()
+            Logger.shared.log("Started mic chunk \(chunkIndex) at \(elapsed)s")
         } catch {
             Logger.shared.log("ERROR creating mic chunk file: \(error)")
         }
@@ -696,12 +693,11 @@ class SimpleRecorder {
         guard let sessionDir = sessionDir else { return }
 
         let tempURL = micChunkFile?.url
-        let overlapFrames = micChunkOverlapFrames
-        let sampleRate = preBufferFormat?.sampleRate ?? 48000
-        let overlapSecs = Double(overlapFrames) / sampleRate
         micChunkFile = nil
         micChunkFrameCount = 0
-        micChunkOverlapFrames = 0
+        micVADHasSpeech = false
+        micVADSilenceStart = nil
+        micChunkStartTime = nil
 
         // Start new chunk immediately so we don't miss audio
         if isRecording {
@@ -727,7 +723,7 @@ class SimpleRecorder {
                 return
             }
             try? FileManager.default.removeItem(at: chunkTempURL)
-            self.transcribeChunk(url: chunkURL, source: "mic", chunkName: chunkName, overlapSeconds: overlapSecs)
+            self.transcribeChunk(url: chunkURL, source: "mic", chunkName: chunkName)
         }
     }
 
@@ -1196,13 +1192,16 @@ class AudioOutput: NSObject, SCStreamOutput {
     private var chunkFile: AVAudioFile?
     private var chunkSampleCount: Int = 0
     private var chunkIndex: Int = 0
-    private var samplesPerChunk: Int { Int(detectedSampleRate) * 15 }  // 15s
     var onChunkReady: ((URL, TimeInterval) -> Void)?  // (url, overlapSeconds)
 
-    // Overlap buffer for seamless chunk boundaries
-    private var overlapBuffer: [AVAudioPCMBuffer] = []
-    private var overlapSamples: Int { Int(detectedSampleRate) * 5 }  // 5s
-    private var chunkOverlapSampleCount: Int = 0
+    // VAD-based chunking for system audio
+    private var sysVADHasSpeech = false
+    private var sysVADSilenceStart: Date?
+    private let sysVADSilenceThreshold: TimeInterval = 1.0  // 1s silence → split
+    private let sysMaxChunkDuration: TimeInterval = 30.0  // Safety cap
+    private var sysChunkStartTime: Date?
+    private var recordingStartTime: Date?
+    private let sysSpeechThresholdRMS: Float = 0.005  // Lower than mic (system audio is quieter pre-boost)
 
     private var audioSettings: [String: Any] {
         [
@@ -1255,7 +1254,8 @@ class AudioOutput: NSObject, SCStreamOutput {
     private func startNewSystemChunk() {
         guard let chunksDir = chunksDir else { return }
 
-        let elapsed = chunkIndex * 15
+        if recordingStartTime == nil { recordingStartTime = Date() }
+        let elapsed = Int(Date().timeIntervalSince(recordingStartTime!))
         let mins = elapsed / 60
         let secs = elapsed % 60
         let chunkName = String(format: "%02d-%02d_audio.wav", mins, secs)
@@ -1264,22 +1264,11 @@ class AudioOutput: NSObject, SCStreamOutput {
         do {
             chunkFile = try AVAudioFile(forWriting: chunkURL, settings: audioSettings, commonFormat: .pcmFormatInt16, interleaved: true)
             chunkSampleCount = 0
-            chunkOverlapSampleCount = 0
             chunkIndex += 1
-
-            // Prepend overlap from previous chunk (not for first chunk)
-            if chunkIndex > 1 {
-                var overlapWritten: Int = 0
-                for buffer in overlapBuffer {
-                    try? chunkFile?.write(from: buffer)
-                    overlapWritten += Int(buffer.frameLength)
-                }
-                chunkSampleCount = overlapWritten
-                chunkOverlapSampleCount = overlapWritten
-                Logger.shared.log("Started system chunk \(chunkIndex) at \(elapsed)s (with \(String(format: "%.1f", Double(overlapWritten) / detectedSampleRate))s overlap)")
-            } else {
-                Logger.shared.log("Started system chunk \(chunkIndex) at \(elapsed)s")
-            }
+            sysVADHasSpeech = false
+            sysVADSilenceStart = nil
+            sysChunkStartTime = Date()
+            Logger.shared.log("Started system chunk \(chunkIndex) at \(elapsed)s")
         } catch {
             Logger.shared.log("ERROR creating system chunk: \(error)")
         }
@@ -1287,25 +1276,27 @@ class AudioOutput: NSObject, SCStreamOutput {
 
     private func finishSystemChunk() {
         let chunkURL = chunkFile?.url
-        let overlapSecs = Double(chunkOverlapSampleCount) / detectedSampleRate
         chunkFile = nil
         chunkSampleCount = 0
-        chunkOverlapSampleCount = 0
+        sysVADHasSpeech = false
+        sysVADSilenceStart = nil
+        sysChunkStartTime = nil
 
         startNewSystemChunk()
 
         if let url = chunkURL {
-            onChunkReady?(url, overlapSecs)
+            onChunkReady?(url, 0)
         }
     }
 
     func finishCurrentChunk() {
         if let url = chunkFile?.url {
-            let overlapSecs = Double(chunkOverlapSampleCount) / detectedSampleRate
             chunkFile = nil
             chunkSampleCount = 0
-            chunkOverlapSampleCount = 0
-            onChunkReady?(url, overlapSecs)
+            sysVADHasSpeech = false
+            sysVADSilenceStart = nil
+            sysChunkStartTime = nil
+            onChunkReady?(url, 0)
         }
     }
 
@@ -1346,25 +1337,42 @@ class AudioOutput: NSObject, SCStreamOutput {
         // Write to main file
         try? audioFile.write(from: pcmBuffer)
 
-        // Write to chunk file for live transcription
+        // Write to chunk file for live transcription (VAD-based)
         if chunksDir != nil {
-            // Maintain overlap buffer (last 5s of PCM buffers)
-            overlapBuffer.append(pcmBuffer)
-            var totalOverlapSamples = overlapBuffer.reduce(0) { $0 + Int($1.frameLength) }
-            while totalOverlapSamples > overlapSamples, !overlapBuffer.isEmpty {
-                totalOverlapSamples -= Int(overlapBuffer.first!.frameLength)
-                overlapBuffer.removeFirst()
-            }
-
             if chunkFile == nil {
                 startNewSystemChunk()
             }
             try? chunkFile?.write(from: pcmBuffer)
             chunkSampleCount += Int(frameCount)
 
-            // Check if new audio (excluding overlap) >= 15s
-            let newSamples = chunkSampleCount - chunkOverlapSampleCount
-            if newSamples >= samplesPerChunk {
+            // Calculate RMS from raw float data (pre-boost) for VAD
+            var rmsSum: Float = 0
+            for frame in 0..<Int(frameCount) {
+                var sample: Float = 0
+                for channel in 0..<channelCount {
+                    sample += floatData[frame * channelCount + channel]
+                }
+                sample = sample / Float(channelCount)
+                rmsSum += sample * sample
+            }
+            let rms = sqrt(rmsSum / Float(frameCount))
+
+            // VAD-based chunk splitting
+            let isSpeech = rms > sysSpeechThresholdRMS
+            if isSpeech {
+                sysVADHasSpeech = true
+                sysVADSilenceStart = nil
+            } else if sysVADHasSpeech {
+                if sysVADSilenceStart == nil {
+                    sysVADSilenceStart = Date()
+                } else if Date().timeIntervalSince(sysVADSilenceStart!) >= sysVADSilenceThreshold {
+                    finishSystemChunk()
+                    return
+                }
+            }
+
+            // Safety cap: force split at max duration
+            if let start = sysChunkStartTime, Date().timeIntervalSince(start) >= sysMaxChunkDuration {
                 finishSystemChunk()
             }
         }
