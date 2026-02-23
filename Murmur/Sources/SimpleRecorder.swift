@@ -739,6 +739,22 @@ class SimpleRecorder {
             text = transcribeChunkSync(url: url, whisperPath: whisperPath, modelPath: modelPath)
         }
 
+        // Filter Whisper hallucinations (common artifacts on silent/near-silent audio)
+        let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let hallucinations: Set<String> = [
+            "", "you", "thank you", "thank you.", "thanks for watching",
+            "thanks for watching.", "bye.", "bye", "you.", "the end.",
+            "the end", "thanks.", "thanks", "so", "i'm sorry.",
+            "(keyboard clicking)", "(mouse clicking)", "(silence)",
+            "(soft music)", "(upbeat music)", "(music)",
+        ]
+        if hallucinations.contains(stripped.lowercased()) {
+            Logger.shared.log("Chunk [\(chunkName)] filtered (hallucination: \"\(stripped)\")")
+            return
+        }
+
         // Write individual chunk txt
         let chunksDir = sessionDir.appendingPathComponent("chunks")
         let txtName = chunkName.replacingOccurrences(of: ".wav", with: ".txt")

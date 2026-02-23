@@ -359,6 +359,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func stopRecording() {
+        recorder?.onChunkTranscribed = nil  // Stop uploading before async transcriptions complete
         recorder?.stop()
         recorder = nil
         isRecording = false
