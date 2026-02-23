@@ -164,6 +164,46 @@ class SecondChairClient {
         }.resume()
     }
 
+    // MARK: - Rotate API Key
+
+    func rotateKey(completion: @escaping (String?) -> Void) {
+        let baseURL = Settings.shared.secondChairBaseURL
+        let apiKey = Settings.shared.secondChairApiKey
+
+        guard let url = URL(string: "\(baseURL)/daemon/rotate-key") else {
+            completion(nil)
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(apiKey, forHTTPHeaderField: "X-Api-Key")
+        request.timeoutInterval = 15
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                Logger.shared.log("SecondChair: Rotate key error — \(error.localizedDescription)")
+                completion(nil)
+                return
+            }
+
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let newKey = json["apiKey"] as? String else {
+                Logger.shared.log("SecondChair: Rotate key — invalid response")
+                completion(nil)
+                return
+            }
+
+            // Update local settings with new key
+            DispatchQueue.main.async {
+                Settings.shared.secondChairApiKey = newKey
+                Logger.shared.log("SecondChair: API key rotated successfully")
+                completion(newKey)
+            }
+        }.resume()
+    }
+
     // MARK: - Upload Chunk to API
 
     func uploadChunk(sessionId: String, content: String, sequenceNum: Int, timestamp: String) {

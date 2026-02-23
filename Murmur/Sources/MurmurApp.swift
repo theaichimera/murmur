@@ -99,6 +99,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(permissionsItem)
         
+        // SecondChair submenu
+        if Settings.shared.isSecondChairConfigured {
+            menu.addItem(NSMenuItem.separator())
+
+            let scMenu = NSMenu()
+
+            let key = Settings.shared.secondChairApiKey
+            let masked = String(key.prefix(8)) + "..." + String(key.suffix(4))
+            let keyLabel = NSMenuItem(title: "Key: \(masked)", action: nil, keyEquivalent: "")
+            keyLabel.isEnabled = false
+            scMenu.addItem(keyLabel)
+
+            let copyItem = NSMenuItem(title: "Copy API Key", action: #selector(copyApiKey), keyEquivalent: "")
+            copyItem.target = self
+            scMenu.addItem(copyItem)
+
+            let rotateItem = NSMenuItem(title: "Rotate API Key", action: #selector(rotateApiKey), keyEquivalent: "")
+            rotateItem.target = self
+            scMenu.addItem(rotateItem)
+
+            let scMenuItem = NSMenuItem(title: "SecondChair", action: nil, keyEquivalent: "")
+            if let linkImage = NSImage(systemSymbolName: "link.circle.fill", accessibilityDescription: nil) {
+                scMenuItem.image = linkImage
+            }
+            scMenuItem.submenu = scMenu
+            menu.addItem(scMenuItem)
+        }
+
         menu.addItem(NSMenuItem.separator())
 
         // Quit
@@ -427,6 +455,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if cleaned > 0 {
             Logger.shared.log("Cleaned up \(cleaned) orphaned temp file(s)")
+        }
+    }
+
+    // MARK: - SecondChair Menu Actions
+
+    @objc func copyApiKey() {
+        let key = Settings.shared.secondChairApiKey
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(key, forType: .string)
+        Logger.shared.log("SecondChair: API key copied to clipboard")
+    }
+
+    @objc func rotateApiKey() {
+        let alert = NSAlert()
+        alert.messageText = "Rotate API Key?"
+        alert.informativeText = "This will generate a new API key and invalidate the current one. The web app will need to be updated with the new key."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Rotate")
+        alert.addButton(withTitle: "Cancel")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            SecondChairClient.shared.rotateKey { newKey in
+                if let newKey = newKey {
+                    let masked = String(newKey.prefix(8)) + "..." + String(newKey.suffix(4))
+                    let successAlert = NSAlert()
+                    successAlert.messageText = "API Key Rotated"
+                    successAlert.informativeText = "New key: \(masked)\n\nThe key has been copied to your clipboard."
+                    successAlert.alertStyle = .informational
+                    successAlert.runModal()
+
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(newKey, forType: .string)
+                } else {
+                    let failAlert = NSAlert()
+                    failAlert.messageText = "Rotation Failed"
+                    failAlert.informativeText = "Could not rotate the API key. Check your connection and try again."
+                    failAlert.alertStyle = .critical
+                    failAlert.runModal()
+                }
+            }
         }
     }
 
