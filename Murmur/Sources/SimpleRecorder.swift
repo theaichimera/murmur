@@ -29,6 +29,8 @@ class SimpleRecorder {
 
     // I/O queue — all file writes happen here, never on the audio thread
     private let ioQueue = DispatchQueue(label: "com.murmur.audio-io", qos: .utility)
+    // Serial queue for Whisper transcription — prevents CPU saturation from concurrent processes
+    private let whisperQueue = DispatchQueue(label: "com.murmur.whisper", qos: .utility)
     
     // VAD (Voice Activity Detection) for continuous mode
     enum VADState { case idle, listening, speaking, silence }
@@ -711,7 +713,7 @@ class SimpleRecorder {
             .replacingOccurrences(of: ".temp.wav", with: ".wav")
         let chunkURL = chunksDir.appendingPathComponent(chunkName)
 
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        whisperQueue.async { [weak self] in
             guard let self = self else { return }
             // Convert to 16kHz WAV for whisper (with timeout)
             let process = Process()
@@ -908,7 +910,7 @@ class SimpleRecorder {
                 if self.isFileRecordingMode, let sessionDir = self.sessionDir {
                     self.audioOutput!.chunksDir = sessionDir.appendingPathComponent("chunks")
                     self.audioOutput!.onChunkReady = { [weak self] url, overlapSecs in
-                        DispatchQueue.global(qos: .utility).async {
+                        self?.whisperQueue.async {
                             self?.transcribeChunk(url: url, source: "audio", chunkName: url.lastPathComponent, overlapSeconds: overlapSecs)
                         }
                     }
