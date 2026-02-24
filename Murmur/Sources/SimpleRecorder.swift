@@ -56,6 +56,7 @@ class SimpleRecorder {
     private var micChunkFile: AVAudioFile?
     private var micChunkFrameCount: UInt32 = 0
     private var chunkIndex: Int = 0
+    private var uploadSeqNum: Int = 0  // Unique per-transcription upload sequence number
     private var chunkWhisperPath: String?
     private var chunkModelPath: String?
     // VAD-based chunking for file recording mode
@@ -775,7 +776,8 @@ class SimpleRecorder {
             // Notify SecondChair for cloud upload
             let content = "[\(source)] \(text)"
             let timestamp = ISO8601DateFormatter().string(from: Date())
-            let seq = self.chunkIndex
+            self.uploadSeqNum += 1
+            let seq = self.uploadSeqNum
             DispatchQueue.main.async {
                 self.onChunkTranscribed?(content, timestamp, seq)
             }
